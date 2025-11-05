@@ -24,6 +24,23 @@ import numpy as np
 import torch.nn.functional as F
 import time
 
+def hellinger_squared(loc1, scale1, loc2, scale2):
+    var1 = scale1.pow(2)
+    var2 = scale2.pow(2)
+    # determinant for diagonal covariance = product of variances
+    det1 = torch.prod(var1, dim=-1)
+    det2 = torch.prod(var2, dim=-1)
+    det_mean = torch.prod((var1 + var2) / 2.0, dim=-1)
+    # coefficient term
+    coef = (det1.pow(0.25) * det2.pow(0.25)) / (det_mean.pow(0.5) + 1e-12)
+    # exponent term
+    inv = 1.0 / ((var1 + var2) / 2.0 + 1e-12)
+    diff = loc1 - loc2
+    exponent = torch.exp(-0.125 * torch.sum(diff * diff * inv, dim=-1))
+    bc = coef * exponent
+    H2 = 1.0 - bc
+    return H2.clamp(min=0.0, max=1.0)
+
 
 class PPOExtension(PPOAgent):
     def __init__(self, config=None):
@@ -42,6 +59,9 @@ class PPOExtension(PPOAgent):
         self.rewards, self.dones, self.action_log_probs = [], [], []
         self.silent = self.cfg.silent
 
+        self.hellinger_coef = 0.0
+        self.behav_means, self.behav_scales = [], []
+
     def update_policy(self):
         """Perform multiple PPO updates over collected rollouts."""
         self.states = torch.stack(self.states)
@@ -51,12 +71,20 @@ class PPOExtension(PPOAgent):
         self.dones = torch.stack(self.dones).squeeze()
         self.action_log_probs = torch.stack(self.action_log_probs).squeeze()
 
+        if len(self.behav_means) > 0:
+            self.behav_means = torch.stack(self.behav_means)
+            self.behav_scales = torch.stack(self.behav_scales)
+        else:
+            self.behav_means = None
+            self.behav_scales = None
+
         for e in range(self.epochs):
             self.ppo_epoch()
 
         # Clear rollout buffers
         self.states, self.actions, self.next_states = [], [], []
         self.rewards, self.dones, self.action_log_probs = [], [], []
+        self.behav_means, self.behav_scales = [], []
 
     def compute_returns(self):
         """
@@ -154,7 +182,23 @@ class PPOExtension(PPOAgent):
 
         L_dual = -(L_dual.mean())
         entropy = action_dists.entropy().mean()
+        
         loss = L_dual + 0.5*value_loss - 0.01*entropy
+        # Hellinger regularizer (requires stored behavior params aligned with batch indices)
+        if self.hellinger_coef > 0.0 and self.behav_means is not None:
+            # states/actions in this function are batched; align by index positions
+            # compute new policy params
+            new_mu = action_dists.mean.squeeze()
+            # handle Normal vs Independent(Normal) shapes
+            new_scale = action_dists.scale.squeeze()
+            # retrieve corresponding behavior params for this batch slice
+            # Note: when using minibatches you must pass the matching slice of behav params into this call;
+            # here we assume ppo_update receives aligned slices from ppo_epoch (it does in the patch above).
+            old_mu = self.behav_means[0: new_mu.shape[0]] if isinstance(self.behav_means, torch.Tensor) else None
+            old_scale = self.behav_scales[0: new_scale.shape[0]] if isinstance(self.behav_scales, torch.Tensor) else None
+            if old_mu is not None:
+                H2 = hellinger_squared(new_mu, new_scale, old_mu.to(self.device), old_scale.to(self.device))
+                loss = loss + float(self.hellinger_coef) * H2.mean()
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -230,6 +274,11 @@ class PPOExtension(PPOAgent):
             L = cu.Logger()
         total_step, run_episode_reward = 0, []
         start = time.perf_counter()
+
+        logging_path = str(self.logging_dir) + '/logs'
+        L.log()
+        if self.cfg.save_logging:
+            L.save(logging_path, self.seed)
 
         for ep in range(self.cfg.train_episodes + 1):
             ratio_of_episodes = (self.cfg.train_episodes - ep) / self.cfg.train_episodes
